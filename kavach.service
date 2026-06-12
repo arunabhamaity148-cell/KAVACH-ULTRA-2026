@@ -1,0 +1,47 @@
+# KAVACH-ULTRA 2026 — systemd service
+# File: /etc/systemd/system/kavach.service
+#
+# Install:
+#   sudo cp kavach.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable kavach
+#   sudo systemctl start kavach
+#
+# Useful commands:
+#   sudo systemctl status kavach
+#   sudo journalctl -u kavach -f         ← live logs
+#   sudo systemctl restart kavach
+#   sudo systemctl stop kavach
+
+[Unit]
+Description=KAVACH-ULTRA 2026 Crypto Signal Bot
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/KAVACH-ULTRA-2026
+ExecStart=/home/ubuntu/KAVACH-ULTRA-2026/venv/bin/python signal_bot.py
+
+# Auto-restart on crash (wait 10 sec before retry)
+Restart=always
+RestartSec=10
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/ubuntu/KAVACH-ULTRA-2026/.env
+
+# Logging — view with: journalctl -u kavach -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kavach
+
+# Safety: kill cleanly on timeout
+TimeoutStopSec=30
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
