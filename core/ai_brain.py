@@ -60,7 +60,6 @@ RSS_FEEDS = [
 
 
 async def fetch_rss_headlines(session: aiohttp.ClientSession) -> List[NewsItem]:
-    """Fetch headlines from crypto RSS feeds concurrently."""
     items: List[NewsItem] = []
     cutoff = time.time() - 3600
 
@@ -88,9 +87,7 @@ async def fetch_rss_headlines(session: aiohttp.ClientSession) -> List[NewsItem]:
     return items
 
 
-# ✅ NEWSAPI FETCHER (Replaces CryptoPanic)
 async def fetch_newsapi_headlines(session: aiohttp.ClientSession) -> List[NewsItem]:
-    """Fetch crypto news from NewsAPI (free tier: 100 req/day)."""
     if not config.NEWSAPI_KEY:
         logger.warning("[AI BRAIN] NEWSAPI_KEY not set. Skipping NewsAPI.")
         return []
@@ -140,16 +137,13 @@ async def fetch_newsapi_headlines(session: aiohttp.ClientSession) -> List[NewsIt
     return items
 
 
-# ❌ CryptoPanic (Deprecated — kept for backward compatibility)
 async def fetch_cryptopanic_headlines(session: aiohttp.ClientSession) -> List[NewsItem]:
-    """DEPRECATED: CryptoPanic free API discontinued."""
     if config.CRYPTOPANIC_API_KEY:
         logger.debug("[AI BRAIN] CryptoPanic deprecated. Use NewsAPI instead.")
     return []
 
 
 async def fetch_twitter_mentions(session: aiohttp.ClientSession) -> List[NewsItem]:
-    """Fetch recent crypto-related tweets via Twitter v2 API."""
     if not config.TWITTER_BEARER_TOKEN:
         return []
     items: List[NewsItem] = []
@@ -209,15 +203,14 @@ JSON format:
 
 
 class AIBrain:
-    """Continuously monitors news and sentiment. Provides trade approval."""
-
-    def __init__(self):
+    def __init__(self, db=None):
         self.client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
         self._session: Optional[aiohttp.ClientSession] = None
         self._current_sentiment: Optional[SentimentResult] = None
         self._blackswan_until: float = 0.0
         self._running = False
         self._lock = asyncio.Lock()
+        self.db = db  # ✅ Database reference for logging
 
     async def start(self):
         self._running = True
@@ -239,8 +232,6 @@ class AIBrain:
             await asyncio.sleep(config.NEWS_REFRESH_SECONDS)
 
     async def _update_sentiment(self):
-        """Gather all headlines, call GPT, update internal state."""
-        # ✅ NewsAPI replaces CryptoPanic
         rss_items, newsapi_items, tw_items = await asyncio.gather(
             fetch_rss_headlines(self._session),
             fetch_newsapi_headlines(self._session),
@@ -316,6 +307,14 @@ class AIBrain:
     async def _apply_sentiment(self, sentiment: SentimentResult):
         async with self._lock:
             self._current_sentiment = sentiment
+
+        # ✅ LOG SENTIMENT TO DATABASE
+        if self.db:
+            try:
+                await self.db.log_sentiment(sentiment)
+                logger.debug("[AI BRAIN] Sentiment logged to database")
+            except Exception as e:
+                logger.warning(f"[AI BRAIN] Failed to log sentiment: {e}")
 
         if sentiment.black_swan:
             pause_until = time.time() + config.SENTIMENT_PAUSE_MINUTES * 60
