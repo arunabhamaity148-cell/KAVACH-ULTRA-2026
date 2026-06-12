@@ -1,17 +1,12 @@
 """
 KAVACH-ULTRA 2026 — core/risk_manager.py
-Institutional-grade risk management:
-  - Dynamic position sizing (1.5% / 3% risk per trade)
-  - Daily loss limit enforcement
-  - Time filter (09:00 – 00:00 IST)
-  - SL/TP calculation with liquidity wall targeting
-  - Regulatory pair filter
+Institutional-grade risk management.
 """
 
 import asyncio
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from typing import Optional, Dict, List
 
 import aiohttp
@@ -24,15 +19,15 @@ from utils.database import TradeDatabase
 @dataclass
 class TradeOrder:
     symbol: str
-    direction: str           # "LONG" | "SHORT"
+    direction: str
     entry_price: float
     stop_loss: float
     take_profit: float
-    quantity: float          # In base asset
-    usdt_risk: float         # Actual USDT at risk
+    quantity: float
+    usdt_risk: float
     leverage: int
-    risk_pct: float          # 0.015 or 0.030
-    strategy: str            # "sweep" | "order_flow" | "funding" | "lead_lag"
+    risk_pct: float
+    strategy: str
     signal_confidence: float
     timestamp: float = field(default_factory=time.time)
 
@@ -75,16 +70,11 @@ class RiskManager:
         direction: str,
         confidence: float,
     ) -> tuple[bool, str]:
-        """
-        Full pre-trade validation.
-        Returns (approved: bool, reason: str)
-        """
-
         # 1. Regulatory filter
         if symbol in config.BANNED_PAIRS:
             return False, f"{symbol} is on the Indian regulatory exclusion list"
 
-        # 2. Time filter (IST)
+        # 2. Time filter (IST) — FIXED
         if not self._is_trading_time():
             ist_now = datetime.now(config.IST)
             return False, f"Outside trading hours (09:00–00:00 IST). Current: {ist_now.strftime('%H:%M IST')}"
@@ -101,21 +91,24 @@ class RiskManager:
         if symbol in self._open_positions:
             return False, f"Already have an open position in {symbol}"
 
-        # 6. Bot-level pause (black swan etc.)
+        # 6. Bot-level pause
         if self.state.trading_paused:
             return False, f"Trading paused: {self.state.pause_reason}"
 
         return True, "All pre-trade checks passed"
 
     def _is_trading_time(self) -> bool:
-        """Check if current IST time is within 09:00 – 00:00."""
+        """Check if current IST time is within 09:00 – 00:00 (exclusive)."""
         now = datetime.now(config.IST)
-        hour = now.hour
-        # Allow 09:00 to 23:59 (inclusive)
-        if config.TRADING_START_HOUR <= hour <= 23:
-            return True
-        # Midnight edge case: 00:00 is end, so hour == 0 is NOT allowed
-        return False
+        current_time = now.time()
+        start_time = dt_time(config.TRADING_START_HOUR, 0)  # 09:00
+        end_time = dt_time(0, 0)  # 00:00
+        
+        # 09:00 to 23:59:59 is allowed
+        # 00:00 to 08:59 is NOT allowed
+        if current_time >= start_time:
+            return True  # 09:00 onwards
+        return False  # 00:00 to 08:59 = STOP
 
     async def _is_daily_loss_hit(self) -> bool:
         limit = self._balance * config.DAILY_LOSS_LIMIT_PCT
@@ -134,17 +127,11 @@ class RiskManager:
         strategy: str,
         is_high_confidence: bool = False,
     ) -> Optional[TradeOrder]:
-        """
-        Kelly-influenced position sizing capped at risk limits.
-        Returns None if RR is insufficient.
-        """
         if entry_price <= 0 or stop_loss <= 0:
             return None
 
-        # Risk percentage
         risk_pct = config.HIGH_CONF_RISK_PCT if is_high_confidence else config.DEFAULT_RISK_PCT
 
-        # Validate SL direction
         if direction == "LONG" and stop_loss >= entry_price:
             logger.warning(f"[RISK] {symbol} LONG: SL ({stop_loss}) >= entry ({entry_price})")
             return None
@@ -152,7 +139,6 @@ class RiskManager:
             logger.warning(f"[RISK] {symbol} SHORT: SL ({stop_loss}) <= entry ({entry_price})")
             return None
 
-        # Risk/Reward check
         if take_profit:
             if direction == "LONG":
                 rr = (take_profit - entry_price) / (entry_price - stop_loss)
@@ -162,21 +148,16 @@ class RiskManager:
                 logger.debug(f"[RISK] {symbol} RR={rr:.2f} < 1.5, skipping")
                 return None
 
-        # USDT risk amount
         usdt_risk = self._balance * risk_pct
-
-        # Distance to SL in price terms
         sl_distance = abs(entry_price - stop_loss)
         sl_distance_pct = sl_distance / entry_price
 
         if sl_distance_pct <= 0:
             return None
 
-        # Position size in USDT (leveraged)
         position_usdt = usdt_risk / sl_distance_pct
-        position_usdt = min(position_usdt, self._balance * config.LEVERAGE * 0.3)  # Max 30% of leveraged capital
+        position_usdt = min(position_usdt, self._balance * config.LEVERAGE * 0.3)
 
-        # Quantity in base asset
         quantity = position_usdt / entry_price
 
         return TradeOrder(
@@ -219,7 +200,6 @@ class RiskManager:
             if not order:
                 return
 
-            # PnL calculation
             if order.direction == "LONG":
                 pnl = (exit_price - order.entry_price) / order.entry_price * order.usdt_risk * order.leverage
             else:
@@ -255,7 +235,6 @@ class RiskManager:
     # ─── BALANCE SYNC ────────────────────────────────────────────────────────
 
     async def _sync_balance(self):
-        """Sync actual balance from Binance REST API."""
         try:
             if not config.BINANCE_API_KEY:
                 logger.warning("[RISK] No Binance API key. Using config capital.")
