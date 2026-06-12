@@ -1,7 +1,7 @@
 """
 KAVACH-ULTRA 2026 — core/ai_brain.py
 GPT-4o-mini powered sentiment analysis and black swan detection.
-Every trade signal MUST be approved here before execution.
+Uses NewsAPI + RSS feeds + Twitter for news aggregation.
 """
 
 import asyncio
@@ -25,18 +25,18 @@ class NewsItem:
     title: str
     source: str
     url: str
-    published: float  # Unix timestamp
+    published: float
     sentiment_score: Optional[float] = None
 
 
 @dataclass
 class SentimentResult:
-    score: float              # -10 to +10
-    label: str                # VERY_BEARISH | BEARISH | NEUTRAL | BULLISH | VERY_BULLISH
-    black_swan: bool          # Emergency flag
+    score: float
+    label: str
+    black_swan: bool
     black_swan_reason: str
     key_headlines: List[str]
-    confidence: float         # 0–1
+    confidence: float
     timestamp: float
 
 
@@ -45,7 +45,7 @@ class SignalApproval:
     approved: bool
     reason: str
     sentiment_score: float
-    confidence_boost: float   # Add to signal confidence if bullish
+    confidence_boost: float
 
 
 # ─── NEWS SCRAPERS ───────────────────────────────────────────────────────────
@@ -58,16 +58,11 @@ RSS_FEEDS = [
     "https://bitcoinmagazine.com/.rss/full/",
 ]
 
-CRYPTOPANIC_URL = (
-    "https://cryptopanic.com/api/v1/posts/"
-    "?auth_token={token}&filter=important&kind=news"
-)
-
 
 async def fetch_rss_headlines(session: aiohttp.ClientSession) -> List[NewsItem]:
     """Fetch headlines from crypto RSS feeds concurrently."""
     items: List[NewsItem] = []
-    cutoff = time.time() - 3600  # Only last 1 hour
+    cutoff = time.time() - 3600
 
     async def _fetch_one(url: str):
         try:
@@ -76,7 +71,7 @@ async def fetch_rss_headlines(session: aiohttp.ClientSession) -> List[NewsItem]:
                     return
                 text = await r.text()
                 feed = feedparser.parse(text)
-                for entry in feed.entries[:10]:  # Top 10 per feed
+                for entry in feed.entries[:10]:
                     pub = time.mktime(entry.get("published_parsed", time.gmtime()))
                     if pub < cutoff:
                         continue
@@ -93,39 +88,68 @@ async def fetch_rss_headlines(session: aiohttp.ClientSession) -> List[NewsItem]:
     return items
 
 
-async def fetch_cryptopanic_headlines(session: aiohttp.ClientSession) -> List[NewsItem]:
-    """Fetch important news from CryptoPanic API."""
-    if not config.CRYPTOPANIC_API_KEY:
+# ✅ NEWSAPI FETCHER (Replaces CryptoPanic)
+async def fetch_newsapi_headlines(session: aiohttp.ClientSession) -> List[NewsItem]:
+    """Fetch crypto news from NewsAPI (free tier: 100 req/day)."""
+    if not config.NEWSAPI_KEY:
+        logger.warning("[AI BRAIN] NEWSAPI_KEY not set. Skipping NewsAPI.")
         return []
+    
     items: List[NewsItem] = []
     try:
-        url = CRYPTOPANIC_URL.format(token=config.CRYPTOPANIC_API_KEY)
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        params = {
+            "q": config.NEWSAPI_QUERY,
+            "apiKey": config.NEWSAPI_KEY,
+            "language": "en",
+            "sortBy": "publishedAt",
+            "pageSize": 20,
+        }
+        async with session.get(
+            config.NEWSAPI_URL,
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
             if r.status != 200:
+                logger.warning(f"[AI BRAIN] NewsAPI error: {r.status}")
                 return []
+            
             data = await r.json()
-            for post in data.get("results", [])[:20]:
-                pub_str = post.get("published_at", "")
+            if data.get("status") != "ok":
+                logger.warning(f"[AI BRAIN] NewsAPI response: {data.get('message', 'Unknown error')}")
+                return []
+            
+            for article in data.get("articles", []):
+                pub_str = article.get("publishedAt", "")
                 try:
                     pub = datetime.fromisoformat(pub_str.replace("Z", "+00:00")).timestamp()
                 except Exception:
                     pub = time.time()
+                
                 items.append(NewsItem(
-                    title=post.get("title", ""),
-                    source="cryptopanic",
-                    url=post.get("url", ""),
+                    title=article.get("title", ""),
+                    source=article.get("source", {}).get("name", "newsapi"),
+                    url=article.get("url", ""),
                     published=pub,
                 ))
+                
+        logger.info(f"[AI BRAIN] NewsAPI fetched {len(items)} headlines")
+        
     except Exception as e:
-        logger.warning(f"[AI BRAIN] CryptoPanic error: {e}")
+        logger.warning(f"[AI BRAIN] NewsAPI error: {e}")
+    
     return items
 
 
+# ❌ CryptoPanic (Deprecated — kept for backward compatibility)
+async def fetch_cryptopanic_headlines(session: aiohttp.ClientSession) -> List[NewsItem]:
+    """DEPRECATED: CryptoPanic free API discontinued."""
+    if config.CRYPTOPANIC_API_KEY:
+        logger.debug("[AI BRAIN] CryptoPanic deprecated. Use NewsAPI instead.")
+    return []
+
+
 async def fetch_twitter_mentions(session: aiohttp.ClientSession) -> List[NewsItem]:
-    """
-    Fetch recent crypto-related tweets via Twitter v2 API.
-    Requires TWITTER_BEARER_TOKEN in .env
-    """
+    """Fetch recent crypto-related tweets via Twitter v2 API."""
     if not config.TWITTER_BEARER_TOKEN:
         return []
     items: List[NewsItem] = []
@@ -151,7 +175,6 @@ async def fetch_twitter_mentions(session: aiohttp.ClientSession) -> List[NewsIte
             data = await r.json()
             for tweet in data.get("data", []):
                 metrics = tweet.get("public_metrics", {})
-                # Weight by engagement
                 engagement = metrics.get("retweet_count", 0) + metrics.get("like_count", 0)
                 if engagement < 10:
                     continue
@@ -186,10 +209,7 @@ JSON format:
 
 
 class AIBrain:
-    """
-    Continuously monitors news and sentiment.
-    Provides trade approval based on real-time sentiment state.
-    """
+    """Continuously monitors news and sentiment. Provides trade approval."""
 
     def __init__(self):
         self.client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
@@ -200,7 +220,6 @@ class AIBrain:
         self._lock = asyncio.Lock()
 
     async def start(self):
-        """Start continuous news monitoring loop."""
         self._running = True
         self._session = aiohttp.ClientSession()
         logger.info("[AI BRAIN] Starting sentiment monitor...")
@@ -212,7 +231,6 @@ class AIBrain:
             await self._session.close()
 
     async def _monitor_loop(self):
-        """Fetch news and update sentiment every NEWS_REFRESH_SECONDS."""
         while self._running:
             try:
                 await self._update_sentiment()
@@ -222,19 +240,19 @@ class AIBrain:
 
     async def _update_sentiment(self):
         """Gather all headlines, call GPT, update internal state."""
-        rss_items, cp_items, tw_items = await asyncio.gather(
+        # ✅ NewsAPI replaces CryptoPanic
+        rss_items, newsapi_items, tw_items = await asyncio.gather(
             fetch_rss_headlines(self._session),
-            fetch_cryptopanic_headlines(self._session),
+            fetch_newsapi_headlines(self._session),
             fetch_twitter_mentions(self._session),
             return_exceptions=True,
         )
 
         all_items: List[NewsItem] = []
-        for result in [rss_items, cp_items, tw_items]:
+        for result in [rss_items, newsapi_items, tw_items]:
             if isinstance(result, list):
                 all_items.extend(result)
 
-        # Sort by recency, take top 30
         all_items.sort(key=lambda x: x.published, reverse=True)
         all_items = all_items[:30]
 
@@ -242,12 +260,10 @@ class AIBrain:
             logger.debug("[AI BRAIN] No headlines found this cycle")
             return
 
-        # Format headlines for GPT
         headlines_text = "\n".join(
             f"- [{item.source}] {item.title}" for item in all_items
         )
 
-        # Quick local black swan check FIRST (saves API call)
         local_bs = self._local_blackswan_check(headlines_text)
         if local_bs:
             sentiment = SentimentResult(
@@ -262,7 +278,6 @@ class AIBrain:
             await self._apply_sentiment(sentiment)
             return
 
-        # Call GPT-4o-mini
         try:
             response = await self.client.chat.completions.create(
                 model=config.AI_MODEL,
@@ -292,7 +307,6 @@ class AIBrain:
             logger.error(f"[AI BRAIN] GPT API error: {e}")
 
     def _local_blackswan_check(self, headlines_text: str) -> Optional[str]:
-        """Fast local keyword scan before calling GPT."""
         text_lower = headlines_text.lower()
         for kw in config.SENTIMENT_BLACKSWAN_KEYWORDS:
             if kw in text_lower:
@@ -309,16 +323,14 @@ class AIBrain:
                 self._blackswan_until = pause_until
 
             logger.critical(
-                f"[AI BRAIN] ⚠️ BLACK SWAN DETECTED: {sentiment.black_swan_reason} "
-                f"| Trading paused for {config.SENTIMENT_PAUSE_MINUTES} minutes"
+                f"[AI BRAIN] ⚠️ BLACK SWAN: {sentiment.black_swan_reason} "
+                f"| Trading paused {config.SENTIMENT_PAUSE_MINUTES}m"
             )
         else:
             logger.info(
-                f"[AI BRAIN] Sentiment updated → {sentiment.label} "
+                f"[AI BRAIN] Sentiment → {sentiment.label} "
                 f"score={sentiment.score:+.1f} conf={sentiment.confidence:.2f}"
             )
-
-    # ─── PUBLIC INTERFACE ─────────────────────────────────────────────────────
 
     def get_sentiment(self) -> Optional[SentimentResult]:
         return self._current_sentiment
@@ -333,35 +345,28 @@ class AIBrain:
     async def approve_signal(
         self,
         symbol: str,
-        direction: str,  # "LONG" | "SHORT"
+        direction: str,
         base_confidence: float,
     ) -> SignalApproval:
-        """
-        Gate every trade through AI approval.
-        Returns SignalApproval with approved=True/False and reason.
-        """
-        # ── Black Swan hard block ──
         if self.is_blackswan_active():
             remaining = int(self.get_blackswan_remaining_seconds() / 60)
             return SignalApproval(
                 approved=False,
-                reason=f"BLACK SWAN active — trading paused ({remaining}m remaining)",
+                reason=f"BLACK SWAN active — paused ({remaining}m remaining)",
                 sentiment_score=self._current_sentiment.score if self._current_sentiment else -10,
                 confidence_boost=0.0,
             )
 
-        # ── No sentiment data yet ──
         if not self._current_sentiment:
             return SignalApproval(
                 approved=False,
-                reason="AI sentiment not yet initialized — waiting for first news fetch",
+                reason="AI sentiment initializing — waiting for first fetch",
                 sentiment_score=0.0,
                 confidence_boost=0.0,
             )
 
         score = self._current_sentiment.score
 
-        # ── LONG signal: reject if sentiment too bearish ──
         if direction == "LONG" and score < config.SENTIMENT_REJECT_THRESHOLD:
             return SignalApproval(
                 approved=False,
@@ -370,7 +375,6 @@ class AIBrain:
                 confidence_boost=0.0,
             )
 
-        # ── SHORT signal: reject if sentiment too bullish ──
         if direction == "SHORT" and score > abs(config.SENTIMENT_REJECT_THRESHOLD):
             return SignalApproval(
                 approved=False,
@@ -379,7 +383,6 @@ class AIBrain:
                 confidence_boost=0.0,
             )
 
-        # ── Confidence boost for aligned sentiment ──
         confidence_boost = 0.0
         if direction == "LONG" and score > config.SENTIMENT_BOOST_THRESHOLD:
             confidence_boost = min((score - config.SENTIMENT_BOOST_THRESHOLD) / 10, 0.2)
